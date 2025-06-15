@@ -1,0 +1,168 @@
+import modal
+import whisperx
+import torch
+import librosa
+from fastapi import Body
+
+# Define the Modal app
+app = modal.App("whispyr-asr-service")
+
+# CUDA configuration from working example
+cuda_version = "11.8.0-cudnn8"
+flavor = "runtime"
+operating_sys = "ubuntu22.04"
+tag = f"{cuda_version}-{flavor}-{operating_sys}"
+
+# Define the image with dependencies from working example
+image = (
+    modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.11")
+    .apt_install(
+        "git",
+        "ffmpeg",
+    )
+    .pip_install(
+        "torch==2.2.2+cu121",
+        "torchaudio==2.2.2+cu121",
+        "numpy<2.0",
+        index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .pip_install(
+        "git+https://github.com/m-bain/whisperx.git@v3.2.0",
+        "ffmpeg-python",
+        "ctranslate2==4.4.0",
+        "transformers",
+        "librosa",
+        "requests",
+        "fastapi[standard]",
+        # "pyannote.audio==3.1.1",  # Required for diarization
+    )
+)
+
+# Define the volume containing your fine-tuned model
+model_volume = modal.Volume.from_name("whispyr-whisperx-model-volume")
+
+GPU_CONFIG = "L40S"
+
+CACHE_DIR = "/cache"
+cache_vol = modal.Volume.from_name("whisper-cache", create_if_missing=True)
+
+
+# Define a class to hold the model
+@app.cls(
+    image=image,
+    gpu=GPU_CONFIG,
+    volumes={"/models": model_volume, CACHE_DIR: cache_vol},
+    scaledown_window=60 * 10,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+@modal.concurrent(max_inputs=15)
+class WhispyrASR:
+    @modal.enter()
+    def load_models(self):
+        # Load the model when the container starts
+        self.device = "cuda"
+        compute_type = "float16"
+
+        self.model = whisperx.load_model(
+            "large-v3",
+            self.device,
+            compute_type=compute_type,
+            download_root=CACHE_DIR,
+            language="ar",
+        )
+
+        # self.model_a, self.metadata = whisperx.load_align_model(
+        #     language_code="ar", device=self.device
+        # )
+        # self.diarize_model = whisperx.DiarizationPipeline(
+        #     use_auth_token=None, device=self.device
+        # )
+
+   @modal.method()
+def transcribe(self, audio_data, sample_rate=16000, diarize=False):
+    """
+    Transcribe audio data and return a single merged text segment without timestamps.
+    """
+    if sample_rate != 16000:
+        audio_data = librosa.resample(audio_data, orig_sr=sample_rate, target_sr=16000)
+        sample_rate = 16000
+
+    # Transcribe the audio using WhisperX
+    result = self.model.transcribe(audio_data, batch_size=8)
+
+    # Merge all text segments into one string
+    full_text = " ".join([seg["text"].strip() for seg in result["segments"]])
+
+    # Return as a single segment, without timestamps
+    return [{"text": full_text}]
+    @modal.method()
+    def transcribe_bytes(self, audio_bytes: bytes, diarize=False):
+        """
+        Transcribe an audio file.
+
+        Args:
+            audio_bytes: Audio file as bytes
+            diarize: Whether to perform speaker diarization
+
+        Returns:
+            Transcription result
+        """
+        import tempfile
+
+        # Load audio
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(audio_bytes)
+            f.flush()
+            path = f.name  # exists in this container
+        audio, sr = librosa.load(path, sr=16000)
+
+        # Transcribe
+        return self.transcribe.local(audio, sr, diarize)
+
+
+# Define an endpoint
+@app.function(
+    image=image,
+    volumes={"/models": model_volume},
+    gpu=GPU_CONFIG,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+@modal.fastapi_endpoint(method="POST")
+def transcribe_endpoint(
+    audio_data: str | None = Body(default=None),
+    audio_url: str | None = Body(default=None),
+    diarize: bool = Body(default=False),
+):
+    """
+    Web endpoint for transcription.
+
+    Args:
+        audio_data: Base64-encoded audio data
+        audio_url: URL to audio file
+        diarize: Whether to perform speaker diarization
+
+    Returns:
+        Transcription result
+    """
+    import base64
+    import requests
+
+    asr = WhispyrASR()
+
+    if audio_data:
+        # Decode base64 audio data
+        audio_bytes = base64.b64decode(audio_data)
+    elif audio_url:
+        resp = requests.get(audio_url, timeout=30)
+        resp.raise_for_status()
+        audio_bytes = resp.content  # ← bytes from HTTP
+    else:
+        return {"error": "No audio data or URL provided"}
+
+    # -------- 2. Invoke the new worker method ----------------------------
+    # This schedules work in the GPU container, sending only the bytes.
+    result_future = asr.transcribe_bytes.remote(audio_bytes, diarize)
+
+    # You can either return the future (Modal auto-awaits in HTTP context)
+    # or block:  return result_future.get()
+    return result_future
